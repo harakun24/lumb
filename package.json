@@ -1,0 +1,35 @@
+{
+  "name": "lumb",
+  "version": "0.0.1",
+  "description": "Manage relational databases using simple URL commands and JavaScript object",
+  "homepage": "https://github.com/harakun24/lumb#readme",
+  "bugs": {
+    "url": "https://github.com/harakun24/lumb/issues"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/harakun24/lumb.git"
+  },
+  "license": "GPL-2.0",
+  "author": "abista, v.d.",
+  "type": "module",
+  "main": "./src/index.js",
+  "exports": {
+    ".": "./src/index.js"
+  },
+  "scripts": {
+    "test": "node --test"
+  },
+  "keywords": [
+    "database",
+    "orm alternative",
+    "sqlite",
+    "postgres",
+    "mysql",
+    "url-driven",
+    "schema",
+    "javascript",
+    "nodejs",
+    "query"
+  ]
+}
