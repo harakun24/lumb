@@ -20,23 +20,6 @@ Beyond availability, `lumb` fits a focused data layer that keeps daily applicati
 
 ---
 
-## Project Architecture
-
-`lumb` is structured into modular files under `src/` and unified in `src/index.js`:
-
-- `src/index.js`: Main entry point (`db`), directive merging, command dispatch, and event bus (`db.on`, `db.off`).
-- `src/dialect.js`: Dialect-specific SQL rules for SQLite, PostgreSQL, and MySQL/MariaDB (identifier quoting, parameter placeholders `$1` vs `?`, column type mapping, `RETURNING`, `ON CONFLICT` vs `ON DUPLICATE KEY UPDATE`, `FOR UPDATE`, `EXPLAIN`, and column inspection).
-- `src/parser.js`: URL command parser (`action:table/pk/subResource?query`), query value coercion, `$` directive separation, and parameterized `WHERE` clause builder (`$or`, `$not`, `IN`, comparison operators, string matchers, and `$exists` relation filters).
-- `src/connection.js`: Multi-alias connection registry (`connect:<alias>`, `close:<alias>`), default connection selection, built-in `node:sqlite` adapter, and dynamic adapters for PostgreSQL and MySQL.
-- `src/schema.js`: Blueprint-by-Example compiler, deferred foreign key linking (`pendingLinks`), 1:1 / 1:N / N:1 / N:M relation setup, owned child tables, junction tables, safe schema evolution (`make:`), row validation, hydration, and `inspect:`.
-- `src/query.js`: Read compiler (`get:`), sub-resource URL navigation, nested relation loading (`$with`), explicit SQL joins (`$join`, `$on`, `$flat`), page pagination (`$page`), cursor pagination (`$cursor`), aggregations (`$group`, `$count`, `$sum`, `$avg`, `$min`, `$max`), soft-delete filtering (`$trash`), `explain:`, and `dump:`.
-- `src/mutation.js`: Write and update engine (`post:`, `patch:`, `delete:`, `seed:`), nested 1:N and N:M writes, atomic `increment`/`decrement`, batch inserts with `$chunk` and `$onConflict`, batch updates, soft-delete execution, and `RESTRICT` / `$cascade` checks.
-- `src/transaction.js`: Explicit transaction lifecycle (`begin:`, `commit:<id>`, `rollback:<id>`), nested savepoints (`begin:<txId>`), connection lock serialization for SQLite, dedicated pooled clients for PostgreSQL/MySQL, transaction timeout auto-rollback, and atomic cross-table `batch:`.
-- `src/scope.js`: Context-scoped wrapper (`scope:<table>`) that injects scope conditions automatically into reads, writes, updates, deletes, and batches.
-- `src/typegen.js`: Optional `.lumb.d.ts` type definition generator when `make:` is called with `$typegen: true` outside production.
-
----
-
 ## Installation and Testing
 
 ### Installation
