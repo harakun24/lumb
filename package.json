@@ -1,5 +1,5 @@
 {
-  "name": "lumbs",
+  "name": "@dim24/lumb",
   "version": "0.0.1",
   "description": "Manage relational databases using simple URL commands and JavaScript object",
   "homepage": "https://github.com/harakun24/lumb#readme",
