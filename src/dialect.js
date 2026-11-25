@@ -1,3 +1,6 @@
+/**
+ * Menyediakan aturan sintaks SQL spesifik untuk SQLite, PostgreSQL, dan MySQL/MariaDB
+ */
 export function createDialect(name = "sqlite") {
   const normalized = normalizeDialectName(name);
 
@@ -144,6 +147,39 @@ export function createDialect(name = "sqlite") {
     };
   }
 
+  function hasIndexQuery(tableName, indexName) {
+    if (normalized === "mysql") {
+      return {
+        sql: "SELECT 1 FROM information_schema.statistics WHERE table_schema = DATABASE() AND table_name = ? AND index_name = ? LIMIT 1;",
+        params: [tableName, indexName]
+      };
+    }
+    return null;
+  }
+
+  function createIndexSql(tableQuoted, indexQuoted, colsQuoted) {
+    if (normalized === "mysql") {
+      return `CREATE INDEX ${indexQuoted} ON ${tableQuoted} (${colsQuoted});`;
+    }
+    return `CREATE INDEX IF NOT EXISTS ${indexQuoted} ON ${tableQuoted} (${colsQuoted});`;
+  }
+
+  function hasForeignKeyQuery(tableName, constraintName) {
+    if (normalized === "mysql") {
+      return {
+        sql: "SELECT 1 FROM information_schema.table_constraints WHERE table_schema = DATABASE() AND table_name = ? AND constraint_name = ? AND constraint_type = 'FOREIGN KEY' LIMIT 1;",
+        params: [tableName, constraintName]
+      };
+    }
+    if (normalized === "postgres") {
+      return {
+        sql: "SELECT 1 FROM information_schema.table_constraints WHERE table_schema = 'public' AND table_name = $1 AND constraint_name = $2 AND constraint_type = 'FOREIGN KEY' LIMIT 1;",
+        params: [tableName, constraintName]
+      };
+    }
+    return null;
+  }
+
   return {
     name: normalized,
     supportsDeferredFkInCreate: normalized === "sqlite",
@@ -159,7 +195,10 @@ export function createDialect(name = "sqlite") {
     forUpdateSql,
     beginTxSql,
     explainSql,
-    inspectColumnsQuery
+    inspectColumnsQuery,
+    hasIndexQuery,
+    createIndexSql,
+    hasForeignKeyQuery
   };
 }
 

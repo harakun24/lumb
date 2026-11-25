@@ -1,14 +1,17 @@
 import { getConnection } from "./connection.js";
 import { generateTypeDefinitions } from "./typegen.js";
 
+/**
+ * Menerjemahkan objek Blueprint-by-Example menjadi struktur tabel & relasi database
+ */
 export async function defineTable(tableName, blueprint, directives = {}) {
   if (!tableName) {
-    throw new Error("a name for a table is required to make:<name_table>.");
+    throw new Error("Nama tabel wajib disebutkan pada perintah make:<nama_tabel>.");
   }
 
   for (const key of Object.keys(blueprint)) {
     if (key.startsWith("$")) {
-      throw new Error(`Name Column can't started with "$": "${key}".`);
+      throw new Error(`Nama kolom tidak boleh diawali karakter "$": "${key}".`);
     }
   }
 
@@ -19,8 +22,14 @@ export async function defineTable(tableName, blueprint, directives = {}) {
     $drop = [],
     $index = [],
     $dryRun = false,
-    $typegen = false
+    $typegen = false,
+    $fresh = false,
+    $ignore = false
   } = directives;
+
+  if ($fresh && $ignore) {
+    throw new Error('Direktif "$fresh" dan "$ignore" tidak dapat digunakan bersamaan pada make:.');
+  }
 
   const columns = new Map();
   const relations = new Map();
@@ -30,6 +39,7 @@ export async function defineTable(tableName, blueprint, directives = {}) {
   let primaryKey = null;
   let softDeletePatch = null;
 
+  // 1. Deteksi perilaku soft-delete dari metode remove()
   if (typeof blueprint.remove === "function") {
     const trackedChanges = {};
     const proxy = new Proxy(
@@ -47,6 +57,7 @@ export async function defineTable(tableName, blueprint, directives = {}) {
     }
   }
 
+  // 2. Urai setiap properti pada objek contoh JS
   for (const key of Object.keys(blueprint)) {
     const desc = Object.getOwnPropertyDescriptor(blueprint, key);
 
@@ -61,6 +72,7 @@ export async function defineTable(tableName, blueprint, directives = {}) {
 
     const rawDef = desc.value;
 
+    // Relasi 1 ke Banyak milik induk: items: [ { ... } ]
     if (
       Array.isArray(rawDef) &&
       rawDef.length === 1 &&
@@ -74,6 +86,7 @@ export async function defineTable(tableName, blueprint, directives = {}) {
       continue;
     }
 
+    // Relasi Banyak ke Banyak: kategori: ["@kategori"]
     if (
       Array.isArray(rawDef) &&
       rawDef.length === 1 &&
@@ -88,7 +101,7 @@ export async function defineTable(tableName, blueprint, directives = {}) {
     const colSpec = parseColumnSpec(key, rawDef);
     if (colSpec.isPrimaryKey) {
       if (primaryKey) {
-        throw new Error(`Tabel "${tableName}" multiple primary key ("${primaryKey}" and "${key}").`);
+        throw new Error(`Tabel "${tableName}" memiliki lebih dari satu primary key ("${primaryKey}" dan "${key}").`);
       }
       primaryKey = key;
     }
@@ -105,6 +118,7 @@ export async function defineTable(tableName, blueprint, directives = {}) {
     columns.set(key, colSpec);
   }
 
+  // 3. Jika tidak ada key: true, buat kolom 'id' otomatis sebagai primary key
   if (!primaryKey) {
     primaryKey = "id";
     const autoIdCol = {
@@ -134,6 +148,7 @@ export async function defineTable(tableName, blueprint, directives = {}) {
     isJunction: false
   };
 
+  // 4. Tautkan relasi ke tabel tujuan (atau antrekan jika tabel tujuan belum dibuat)
   const deferredFkConstraints = [];
 
   for (const [colName, rel] of relations.entries()) {
@@ -149,6 +164,7 @@ export async function defineTable(tableName, blueprint, directives = {}) {
     }
   }
 
+  // Selesaikan antrean relasi tertunda dari tabel sebelumnya yang menunggu tabel ini
   const remainingPending = [];
   for (const pending of schema.pendingLinks) {
     if (pending.rel.targetTable === tableName) {
@@ -158,9 +174,16 @@ export async function defineTable(tableName, blueprint, directives = {}) {
         registerReverseRelation(tableDef, srcDef, pending.colName);
         if (!dialect.supportsDeferredFkInCreate) {
           const fkName = `fk_${srcDef.name}_${pending.colName}`;
-          deferredFkConstraints.push(
-            `ALTER TABLE ${dialect.quoteId(srcDef.name)} ADD CONSTRAINT ${dialect.quoteId(fkName)} FOREIGN KEY (${dialect.quoteId(pending.colName)}) REFERENCES ${dialect.quoteId(tableName)}(${dialect.quoteId(tableDef.primaryKey)}) ON DELETE RESTRICT;`
-          );
+          const fkCheck = dialect.hasForeignKeyQuery(srcDef.name, fkName);
+          const fkExists = fkCheck
+            ? await conn.adapter.get(fkCheck.sql, fkCheck.params)
+            : false;
+
+          if (!fkExists) {
+            deferredFkConstraints.push(
+              `ALTER TABLE ${dialect.quoteId(srcDef.name)} ADD CONSTRAINT ${dialect.quoteId(fkName)} FOREIGN KEY (${dialect.quoteId(pending.colName)}) REFERENCES ${dialect.quoteId(tableName)}(${dialect.quoteId(tableDef.primaryKey)}) ON DELETE RESTRICT;`
+            );
+          }
         }
       }
     } else {
@@ -176,9 +199,29 @@ export async function defineTable(tableName, blueprint, directives = {}) {
     }
   }
 
-  const plannedSql = await buildOrMigrateTableSql(conn, tableDef, { $rename, $drop, $index });
-  plannedSql.push(...deferredFkConstraints);
+  // 5. Bangun perintah SQL DDL (DROP jika $fresh, abaikan jika $ignore, atau CREATE/ALTER)
+  const plannedSql = await buildOrMigrateTableSql(conn, tableDef, {
+    $rename,
+    $drop,
+    $index,
+    $fresh,
+    $ignore,
+    childTables: childBlueprints.map((c) => c.childTableName),
+    junctionTables: manyToManyDefs.map((m) => `_rel_${tableName}_${m.fieldName}`)
+  });
 
+  if (!$ignore) {
+    plannedSql.push(...deferredFkConstraints);
+  }
+
+  // Eksekusi DDL tabel induk lebih dulu agar tabel referensi sudah tersedia di DB
+  if (!$dryRun) {
+    for (const sql of plannedSql) {
+      await conn.adapter.exec(sql);
+    }
+  }
+
+  // 6. Bangun sub-tabel 1:N milik induk (sekarang tabel induk sudah eksis di DB)
   for (const child of childBlueprints) {
     const fkColName = `${tableName}_id`;
     const parentPkCol = columns.get(primaryKey);
@@ -188,13 +231,20 @@ export async function defineTable(tableName, blueprint, directives = {}) {
         length: parentPkCol.length ?? undefined,
         max: parentPkCol.max ?? undefined,
         _ownedParent: { table: tableName, key: primaryKey }
-      },
-      ...child.childBlueprint
+      }
     };
+
+    // Salin seluruh properti & getter dari childBlueprint secara utuh menggunakan descriptor
+    for (const childKey of Object.keys(child.childBlueprint)) {
+      const childDesc = Object.getOwnPropertyDescriptor(child.childBlueprint, childKey);
+      Object.defineProperty(childSchemaObj, childKey, childDesc);
+    }
 
     const childRes = await defineTable(child.childTableName, childSchemaObj, {
       $connection: directives.$connection,
-      $dryRun
+      $dryRun,
+      $fresh,
+      $ignore
     });
     if ($dryRun && Array.isArray(childRes.sql)) {
       plannedSql.push(...childRes.sql);
@@ -208,6 +258,8 @@ export async function defineTable(tableName, blueprint, directives = {}) {
     });
   }
 
+  // 7. Bangun tabel perantara (pivot) untuk relasi N:M
+  const junctionSqlList = [];
   for (const m2m of manyToManyDefs) {
     const junctionName = `_rel_${tableName}_${m2m.fieldName}`;
     const localFk = `${tableName}_id`;
@@ -220,8 +272,21 @@ export async function defineTable(tableName, blueprint, directives = {}) {
       : dialect.mapColumnType({ jsType: "Number", isInteger: true });
 
     const q = dialect.quoteId;
-    const createJunctionSql = `CREATE TABLE IF NOT EXISTS ${q(junctionName)} (\n  ${q(localFk)} ${localSqlType} NOT NULL,\n  ${q(targetFk)} ${targetSqlType} NOT NULL,\n  PRIMARY KEY (${q(localFk)}, ${q(targetFk)})\n);`;
-    plannedSql.push(createJunctionSql);
+    const inspectJunction = dialect.inspectColumnsQuery(junctionName);
+    const junctionCols = await conn.adapter.all(inspectJunction.sql, inspectJunction.params);
+    const junctionExists = junctionCols.length > 0;
+
+    if (!($ignore && junctionExists)) {
+      if ($fresh) {
+        const dropJunctionSql = buildDropTableSql(dialect, junctionName);
+        plannedSql.push(dropJunctionSql);
+        junctionSqlList.push(dropJunctionSql);
+      }
+
+      const createJunctionSql = `CREATE TABLE IF NOT EXISTS ${q(junctionName)} (\n  ${q(localFk)} ${localSqlType} NOT NULL,\n  ${q(targetFk)} ${targetSqlType} NOT NULL,\n  PRIMARY KEY (${q(localFk)}, ${q(targetFk)})\n);`;
+      plannedSql.push(createJunctionSql);
+      junctionSqlList.push(createJunctionSql);
+    }
 
     schema.tables.set(junctionName, {
       name: junctionName,
@@ -250,7 +315,7 @@ export async function defineTable(tableName, blueprint, directives = {}) {
     return { dryRun: true, table: tableName, dialect: dialect.name, sql: plannedSql };
   }
 
-  for (const sql of plannedSql) {
+  for (const sql of junctionSqlList) {
     await conn.adapter.exec(sql);
   }
 
@@ -259,6 +324,17 @@ export async function defineTable(tableName, blueprint, directives = {}) {
   }
 
   return { defined: true, table: tableName, primaryKey };
+}
+
+function buildDropTableSql(dialect, targetTable) {
+  const q = dialect.quoteId;
+  if (dialect.name === "postgres") {
+    return `DROP TABLE IF EXISTS ${q(targetTable)} CASCADE;`;
+  }
+  if (dialect.name === "mysql") {
+    return `SET FOREIGN_KEY_CHECKS = 0; DROP TABLE IF EXISTS ${q(targetTable)}; SET FOREIGN_KEY_CHECKS = 1;`;
+  }
+  return `DROP TABLE IF EXISTS ${q(targetTable)};`;
 }
 
 function parseColumnSpec(name, rawDef) {
@@ -276,6 +352,7 @@ function parseColumnSpec(name, rawDef) {
     inner = inner.find((item) => item !== null);
   }
 
+  // Referensi tabel lain: "@kategori"
   if (typeof inner === "string" && inner.startsWith("@")) {
     return {
       name,
@@ -290,6 +367,7 @@ function parseColumnSpec(name, rawDef) {
     };
   }
 
+  // Konfigurasi objek: { type, length, min, max, key, default }
   if (inner && typeof inner === "object" && !(inner instanceof Date) && inner.type) {
     const jsType = mapConstructorName(inner.type);
     const hasDefault = "default" in inner || nullable;
@@ -310,6 +388,7 @@ function parseColumnSpec(name, rawDef) {
     };
   }
 
+  // Konstruktor tipe murni: String, Number, Boolean, Date
   if (inner === String || inner === Number || inner === Boolean || inner === Date) {
     const jsType = mapConstructorName(inner);
     return {
@@ -324,6 +403,7 @@ function parseColumnSpec(name, rawDef) {
     };
   }
 
+  // Fungsi dinamis: () => ... atau (item) => ...
   if (typeof inner === "function") {
     const sample = inner.length === 0 ? inner() : new Date();
     const jsType = sample instanceof Date
@@ -347,6 +427,7 @@ function parseColumnSpec(name, rawDef) {
     };
   }
 
+  // Nilai primitif langsung: "", 0, false, new Date()
   const jsType = inner instanceof Date
     ? "Date"
     : typeof inner === "number"
@@ -405,15 +486,36 @@ function registerReverseRelation(targetTableDef, childTableDef, fkColName) {
   }
 }
 
-async function buildOrMigrateTableSql(conn, tableDef, { $rename, $drop, $index }) {
+async function buildOrMigrateTableSql(
+  conn,
+  tableDef,
+  { $rename, $drop, $index, $fresh, $ignore, childTables = [], junctionTables = [] }
+) {
   const { dialect } = conn;
   const q = dialect.quoteId;
   const sqlList = [];
 
   const inspectQuery = dialect.inspectColumnsQuery(tableDef.name);
   const existingCols = await conn.adapter.all(inspectQuery.sql, inspectQuery.params);
+  const tableExists = existingCols.length > 0;
 
-  if (existingCols.length === 0) {
+  // Mode $ignore: jika tabel sudah tersedia di DB, lewati CREATE / ALTER / INDEX
+  if ($ignore && tableExists) {
+    return sqlList;
+  }
+
+  // Mode $fresh: hapus tabel lama (beserta tabel anak & pivot) sebelum membuat ulang
+  if ($fresh) {
+    for (const childTable of childTables) {
+      sqlList.push(buildDropTableSql(dialect, childTable));
+    }
+    for (const junctionTable of junctionTables) {
+      sqlList.push(buildDropTableSql(dialect, junctionTable));
+    }
+    sqlList.push(buildDropTableSql(dialect, tableDef.name));
+  }
+
+  if (!tableExists || $fresh) {
     const colDefs = [];
     for (const col of tableDef.columns.values()) {
       colDefs.push(compileColumnSql(col, dialect, false));
@@ -447,9 +549,21 @@ async function buildOrMigrateTableSql(conn, tableDef, { $rename, $drop, $index }
   for (const idxCols of $index) {
     const cols = Array.isArray(idxCols) ? idxCols : [idxCols];
     const idxName = `idx_${tableDef.name}_${cols.join("_")}`;
-    sqlList.push(
-      `CREATE INDEX IF NOT EXISTS ${q(idxName)} ON ${q(tableDef.name)} (${cols.map(q).join(", ")});`
-    );
+    const colsQuoted = cols.map(q).join(", ");
+
+    if (dialect.name === "mysql") {
+      if ($fresh) {
+        sqlList.push(dialect.createIndexSql(q(tableDef.name), q(idxName), colsQuoted));
+      } else {
+        const checkQuery = dialect.hasIndexQuery(tableDef.name, idxName);
+        const exists = await conn.adapter.get(checkQuery.sql, checkQuery.params);
+        if (!exists) {
+          sqlList.push(dialect.createIndexSql(q(tableDef.name), q(idxName), colsQuoted));
+        }
+      }
+    } else {
+      sqlList.push(dialect.createIndexSql(q(tableDef.name), q(idxName), colsQuoted));
+    }
   }
 
   return sqlList;
@@ -513,6 +627,9 @@ function compileColumnSql(col, dialect, isAlter = false) {
   return parts.join(" ");
 }
 
+/**
+ * Validasi tipe, panjang, dan rentang nilai pada sisi JS sebelum mengirim ke DB
+ */
 export function validateAndPrepareRow(tableDef, schema, inputRow, isPatch = false) {
   const prepared = {};
 
@@ -521,6 +638,7 @@ export function validateAndPrepareRow(tableDef, schema, inputRow, isPatch = fals
 
     let val = inputRow[colName];
 
+    // Ekstrak kunci utama otomatis jika pengguna menyisipkan objek relasi utuh
     if (val && typeof val === "object" && !(val instanceof Date) && col.refTable) {
       const targetDef = schema.tables.get(col.refTable);
       if (targetDef && targetDef.primaryKey in val) {
@@ -599,6 +717,9 @@ export function validateAndPrepareRow(tableDef, schema, inputRow, isPatch = fals
   return prepared;
 }
 
+/**
+ * Mengembalikan tipe data JS asli (Boolean, Date) dan memasang getter pada baris hasil kueri
+ */
 export function hydrateRow(tableDef, rawRow) {
   if (!rawRow || !tableDef) return rawRow;
   const obj = {};
@@ -629,19 +750,6 @@ export function hydrateRow(tableDef, rawRow) {
 
   return obj;
 }
-
-// export function assertSchemaReady(conn, tableName) {
-//   const { schema } = conn;
-//   if (schema.pendingLinks.length > 0) {
-//     const missing = [...new Set(schema.pendingLinks.map((p) => p.rel.targetTable))];
-//     throw new Error(`Tabel rujukan belum didefinisikan dengan make: -> ${missing.join(", ")}`);
-//   }
-//   const tableDef = schema.tables.get(tableName);
-//   if (!tableDef) {
-//     throw new Error(`Tabel "${tableName}" belum didefinisikan. Jalankan db("make:${tableName}", ...) terlebih dahulu.`);
-//   }
-//   return tableDef;
-// }
 
 export function assertSchemaReady(conn, tableName) {
   const { schema } = conn;

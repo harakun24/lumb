@@ -1,12 +1,12 @@
-# lumb
+# lumbs
 
 URL-driven database library for JavaScript that pairs plain-object simplicity with full control over schemas, relations, and transactions.
 
-## Why the Name `lumb`
+## Why the Name `lumbs`
 
-The name `lumb` was chosen after checking package name availability and confirming that the name was not yet taken on npm. This makes the package short, memorable, and clean for both installation (`npm install lumb`) and imports (`import db from "lumb"`).
+The name `lumbs` was chosen after checking package name availability and confirming that the name was not yet taken on npm. This makes the package short, memorable, and clean for both installation (`npm install lumbs`) and imports (`import db from "lumbs"`).
 
-Beyond availability, `lumb` fits a focused data layer that keeps daily application code concise while exposing explicit database primitives such as schema definitions, relational modeling, batch operations, transactions, and dialect-aware SQL compilation.
+Beyond availability, `lumbs` fits a focused data layer that keeps daily application code concise while exposing explicit database primitives such as schema definitions, relational modeling, batch operations, transactions, and dialect-aware SQL compilation.
 
 ---
 
@@ -25,7 +25,7 @@ Beyond availability, `lumb` fits a focused data layer that keeps daily applicati
 ### Installation
 
 ```bash
-npm install lumb
+npm install lumbs
 ```
 
 Optional drivers for external databases:
@@ -47,7 +47,7 @@ npm install mysql2
 Register connections by alias name. The first registered connection becomes the default unless another connection passes `default: true`.
 
 ```javascript
-import db from "lumb";
+import db from "lumbs";
 
 // SQLite in-memory or file (zero external dependencies)
 await db("connect:arsip", { url: ":memory:" });
@@ -101,7 +101,7 @@ Define tables with plain JavaScript example objects. If no property sets `key: t
 - **Computed getters**: `get subtotal() { return this.qty * this.hargaSatuan; }` attaches non-persisted getters to hydrated result objects.
 - **Soft-delete via `remove()`**: Defining a `remove() { this.deletedAt = new Date(); }` method enables soft-delete so `delete:` updates the target column instead of deleting the row physically.
 - **Composite and single indexes**: `$index: [["colA", "colB"], "colC"]`.
-- **Dry run & type generation**: `$dryRun: true` returns generated SQL statements without executing them; `$typegen: true` writes `.lumb.d.ts` in non-production environments.
+- **Dry run & type generation**: `$dryRun: true` returns generated SQL statements without executing them; `$typegen: true` writes `.lumbs.d.ts` in non-production environments.
 
 #### Relations and Deferred Linking
 
@@ -116,6 +116,8 @@ Running `make:<table>` on an existing table compares columns and applies safe ch
 - Adds new columns (`ALTER TABLE ... ADD COLUMN ...`).
 - Renames columns without losing data using `$rename: { oldCol: "newCol" }`.
 - Drops columns only when explicitly listed in `$drop: ["obsoleteCol"]`.
+- Adds $fresh: true for always make a fresh table
+- Adds $ignore: true for ignoring the table definition when the table already exist
 
 ```javascript
 // Deferred link: produk references kategori before kategori is created
@@ -159,6 +161,28 @@ await db("make:transaksi", {
     },
   ],
 });
+
+// always fresh
+await db(
+  "make:produk",
+  {
+    kode: { type: String, length: 6, key: true },
+    nama: String,
+    stok: 0,
+  },
+  { $fresh: true },
+);
+
+// not making table that already exist
+await db(
+  "make:produk",
+  {
+    kode: { type: String, length: 6, key: true },
+    nama: String,
+    stok: 0,
+  },
+  { $ignore: true },
+);
 ```
 
 ---

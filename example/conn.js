@@ -2,13 +2,15 @@ import db from "../src/index.js";
 
 export default async function () {
 
-  await db("connect:main", { url: "sqlite:./example.db" });
+  await db("connect:main", { url: "sqlite:example.db" });
+  // await db("connect:main", { url: "mysql://kasir:123@localhost:3306/kasir" });
+  // await db("connect:main", { url: "postgres://postgres:postgres@localhost:5432/kasir" });
   // await db("connect:arsip", { url: ":memory:" });
   // PostgreSQL: { url: "postgres://user:pass@localhost:5432/kasir" }
   // MySQL:      { url: "mysql://user:pass@localhost:3306/kasir" }
 
-  db.on("patch:produk", (produk) => {
-    if (produk && produk.stok <= 5) {
+  db.on("get:produk", (produk) => {
+    if (produk) {
       console.log(`[STOCK WARNING] ${produk.nama} - ${produk.stok}`);
     }
   });
