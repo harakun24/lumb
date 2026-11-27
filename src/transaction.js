@@ -152,26 +152,83 @@ export function resolveExecutionTarget(directives = {}) {
   return { conn, runner: conn.adapter };
 }
 
-export async function executeCrossBatch(commands, dbExecutor, directives = {}) {
+export async function executeCrossBatch(commands, dbExecutor, directives = {}, eventSink = () => { }) {
   if (!Array.isArray(commands)) {
     throw new Error('Perintah "batch:" wajib menerima Array berisi daftar operasi.');
   }
 
-  const txId = await beginTransaction(null, directives);
-  try {
-    const results = [];
-    for (const entry of commands) {
-      const [cmd, payload = {}, opts = {}] = entry;
-      if (Array.isArray(payload)) {
-        results.push(await dbExecutor(cmd, payload, { ...opts, $tx: txId }));
-      } else {
-        results.push(await dbExecutor(cmd, payload, { ...opts, $tx: txId }));
-      }
+  const maxAttempts = normalizeRetryAttempts(directives.$retry);
+  if (maxAttempts > 1) {
+    const { conn } = resolveExecutionTarget(directives);
+    const hasCallbacks = [...conn.schema.tables.values()].some((table) =>
+      table.contracts?.length > 0 || table.getters?.size > 0 || table.removeFn
+    );
+    if (hasCallbacks) {
+      throw new Error(
+        '"$retry" tidak dapat mengulang batch ketika schema memiliki contract, getter, atau soft-delete callback; callback mungkin memiliki side effect eksternal.'
+      );
     }
-    await commitTransaction(txId);
-    return results;
-  } catch (err) {
-    await rollbackTransaction(txId);
-    throw err;
   }
+
+  for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+    let txId = null;
+    const results = [];
+    const events = [];
+    try {
+      txId = await beginTransaction(null, directives);
+      for (const entry of commands) {
+        if (!Array.isArray(entry) || typeof entry[0] !== "string") {
+          throw new Error('"batch:" berisi operasi dengan format [command, payload, options] yang tidak valid.');
+        }
+        const [cmd, payload = {}, opts = {}] = entry;
+        const txOptions = { ...opts, $tx: txId };
+        const result = maxAttempts > 1
+          ? await dbExecutor(cmd, payload, txOptions, (name, detail) => events.push([name, detail]))
+          : await dbExecutor(cmd, payload, txOptions);
+        results.push(result);
+      }
+      await commitTransaction(txId);
+    } catch (error) {
+      if (txId) await rollbackTransaction(txId);
+      if (attempt >= maxAttempts || !isTransientDatabaseError(error)) {
+        throw error;
+      }
+      await delay(Math.min(25 * (2 ** (attempt - 1)), 500));
+      continue;
+    }
+    for (const [name, detail] of events) eventSink(name, detail);
+    return results;
+  }
+  throw new Error('"$retry" selesai tanpa hasil transaksi.');
+}
+
+function normalizeRetryAttempts(value) {
+  if (value === undefined) return 1;
+  const retries = value === true ? 2 : value;
+  if (typeof retries !== "number" || !Number.isSafeInteger(retries) || retries < 0 || retries > 5) {
+    throw new Error('"$retry" wajib berupa boolean true atau jumlah retry integer antara 0 dan 5.');
+  }
+  return retries + 1;
+}
+
+function isTransientDatabaseError(error) {
+  const transientCodes = new Set([
+    "40001",
+    "40P01",
+    "55P03",
+    "ER_LOCK_DEADLOCK",
+    "ER_LOCK_WAIT_TIMEOUT",
+    "SQLITE_BUSY",
+    "SQLITE_LOCKED",
+    "ERR_SQLITE_BUSY",
+    "ERR_SQLITE_LOCKED"
+  ]);
+  for (let current = error; current; current = current.cause) {
+    if (transientCodes.has(current.code) || [5, 6].includes(current.errcode)) return true;
+  }
+  return false;
+}
+
+function delay(milliseconds) {
+  return new Promise((resolve) => setTimeout(resolve, milliseconds));
 }

@@ -6,6 +6,10 @@ export async function executeGet(parsed, filters, directives, emitEvent) {
   const { conn, runner } = resolveExecutionTarget(directives);
   const tableDef = assertSchemaReady(conn, parsed.table);
 
+  if (directives.$stream !== undefined) {
+    return createQueryStream(parsed, filters, directives, emitEvent, tableDef);
+  }
+
   if (parsed.pk !== null && parsed.subResource) {
     return executeSubResourceGet(tableDef, parsed.pk, parsed.subResource, filters, directives, emitEvent);
   }
@@ -79,6 +83,80 @@ export async function executeGet(parsed, filters, directives, emitEvent) {
   }
 
   return rows;
+}
+
+function createQueryStream(parsed, filters, directives, emitEvent, tableDef) {
+  const streamSize = directives.$stream === true ? 100 : Number(directives.$stream);
+  if (!Number.isSafeInteger(streamSize) || streamSize < 1 || streamSize > 1000) {
+    throw new Error('"$stream" wajib bernilai true atau integer antara 1 dan 1000.');
+  }
+  if (
+    parsed.pk !== null ||
+    directives.$page !== undefined ||
+    directives.$offset !== undefined ||
+    directives.$cursor !== undefined ||
+    directives.$sort !== undefined ||
+    directives.$group ||
+    hasAggregationDirective(directives) ||
+    (directives.$with && hasExplicitSqlJoin(tableDef, directives.$with)) ||
+    Object.prototype.hasOwnProperty.call(filters, tableDef.primaryKey)
+  ) {
+    throw new Error(
+      '"$stream" mendukung query tabel tanpa offset/page/cursor/sort/aggregation dan tidak menerima filter primary key.'
+    );
+  }
+  if (directives.$fields !== undefined) {
+    const fields = normalizeRequestedFields(directives.$fields);
+    if (!fields) {
+      throw new Error('Direktif "$fields" pada "$stream" wajib berupa Array tidak kosong.');
+    }
+    if (!fields.includes(tableDef.primaryKey)) {
+      throw new Error(`"$stream" memerlukan primary key "${tableDef.primaryKey}" pada direktif "$fields".`);
+    }
+  }
+  const maxRows = directives.$limit === undefined ? Infinity : Number(directives.$limit);
+  if (!Number.isSafeInteger(maxRows) && maxRows !== Infinity) {
+    throw new Error('"$limit" pada "$stream" wajib berupa integer positif.');
+  }
+  if (maxRows < 1) {
+    throw new Error('"$limit" pada "$stream" wajib berupa integer positif.');
+  }
+
+  return streamRows(parsed, filters, directives, emitEvent, tableDef, streamSize, maxRows);
+}
+
+async function* streamRows(parsed, filters, directives, emitEvent, tableDef, streamSize, maxRows) {
+  let cursor = null;
+  let yielded = 0;
+  while (yielded < maxRows) {
+    const pageSize = Math.min(streamSize, maxRows - yielded);
+    const pageDirectives = {
+      ...directives,
+      $stream: undefined,
+      $cursor: cursor,
+      $limit: pageSize,
+      $sort: `${tableDef.primaryKey}:asc`
+    };
+    delete pageDirectives.$page;
+    delete pageDirectives.$offset;
+
+    const rows = await executeGet(parsed, filters, pageDirectives, emitEvent);
+    if (!Array.isArray(rows)) {
+      throw new Error('"$stream" hanya dapat mengiterasi hasil query berupa daftar record.');
+    }
+    if (rows.length === 0) return;
+    for (const row of rows) {
+      const nextCursor = row[tableDef.primaryKey];
+      if (nextCursor === undefined || nextCursor === null || nextCursor === cursor) {
+        throw new Error(`"$stream" tidak dapat melanjutkan tanpa primary key "${tableDef.primaryKey}" yang unik.`);
+      }
+      cursor = nextCursor;
+      yielded += 1;
+      yield row;
+      if (yielded >= maxRows) return;
+    }
+    if (rows.length < pageSize) return;
+  }
 }
 
 function compileSelectSql(tableDef, filters, directives, conn) {

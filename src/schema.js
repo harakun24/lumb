@@ -339,6 +339,169 @@ export async function defineTable(tableName, blueprint, directives = {}) {
   return { defined: true, table: tableName, primaryKey };
 }
 
+export async function dropTable(tableName, directives = {}) {
+  if (!tableName) {
+    throw new Error('Nama tabel wajib disebutkan pada perintah "drop:<nama_tabel>".');
+  }
+  if (directives.$tx !== undefined) {
+    throw new Error('"drop:" tidak dapat dijalankan di dalam transaksi karena dukungan DDL berbeda antar-DBMS.');
+  }
+  if (
+    directives.$cascade !== undefined &&
+    typeof directives.$cascade !== "boolean"
+  ) {
+    throw new Error('Direktif "$cascade" pada "drop:" wajib berupa boolean.');
+  }
+
+  const conn = getConnection(directives.$connection);
+  const { schema } = conn;
+  if (!schema.tables.has(tableName)) {
+    throw new Error(`Tabel "${tableName}" belum didefinisikan pada koneksi ini.`);
+  }
+
+  const cascade = directives.$cascade === true;
+  const tables = collectDropTables(schema, tableName);
+  if (!cascade && tables.size > 1) {
+    const dependents = [...tables].filter((name) => name !== tableName);
+    throw new Error(
+      `Tabel "${tableName}" memiliki dependensi: ${dependents.join(", ")}. ` +
+      'Gunakan "$cascade: true" untuk menghapus seluruh tabel yang bergantung.'
+    );
+  }
+
+  const dropOrder = buildDropOrder(schema, tables);
+  const sql = dropOrder.map((name) => buildExplicitDropTableSql(conn.dialect, name));
+  if (directives.$dryRun) {
+    return {
+      dryRun: true,
+      table: tableName,
+      dialect: conn.dialect.name,
+      tables: dropOrder,
+      sql
+    };
+  }
+
+  const droppedTables = [];
+  for (const name of dropOrder) {
+    try {
+      await conn.adapter.exec(buildExplicitDropTableSql(conn.dialect, name));
+    } catch (error) {
+      if (droppedTables.length === 0) throw error;
+      throw new Error(
+        `DROP TABLE berhenti setelah menghapus [${droppedTables.join(", ")}]; ` +
+        `tabel "${name}" gagal dihapus: ${error.message}`,
+        { cause: error }
+      );
+    }
+    removeDroppedTableFromSchema(schema, name);
+    droppedTables.push(name);
+  }
+  return {
+    dropped: true,
+    table: tableName,
+    tables: droppedTables
+  };
+}
+
+function collectDropTables(schema, rootTable) {
+  const tables = new Set();
+  const pending = [rootTable];
+  while (pending.length > 0) {
+    const current = pending.pop();
+    if (tables.has(current)) continue;
+    tables.add(current);
+    for (const dependent of getDropDependents(schema, current)) {
+      if (!schema.tables.has(dependent)) {
+        throw new Error(
+          `Dependensi "${dependent}" dari tabel "${current}" tidak tersedia pada schema Lumb.`
+        );
+      }
+      pending.push(dependent);
+    }
+  }
+  return tables;
+}
+
+function getDropDependents(schema, tableName) {
+  const dependents = new Set();
+  const tableDef = schema.tables.get(tableName);
+  for (const relation of tableDef?.relations.values() ?? []) {
+    if (
+      relation.kind === "one-to-many-owned" ||
+      relation.kind === "one-to-many-reverse"
+    ) {
+      dependents.add(relation.targetTable);
+    } else if (relation.kind === "many-to-many") {
+      dependents.add(relation.junctionTable);
+    }
+  }
+
+  for (const candidate of schema.tables.values()) {
+    if (candidate.name === tableName) continue;
+    for (const relation of candidate.relations.values()) {
+      if (
+        (relation.kind === "many-to-one" || relation.kind === "one-to-one") &&
+        relation.targetTable === tableName
+      ) {
+        dependents.add(candidate.name);
+      } else if (
+        relation.kind === "many-to-many" &&
+        relation.targetTable === tableName
+      ) {
+        dependents.add(relation.junctionTable);
+      }
+    }
+  }
+
+  for (const pending of schema.pendingLinks) {
+    if (pending.rel.targetTable === tableName) dependents.add(pending.sourceTable);
+  }
+  dependents.delete(tableName);
+  return dependents;
+}
+
+function buildDropOrder(schema, tables) {
+  const order = [];
+  const visiting = new Set();
+  const visited = new Set();
+  const visit = (tableName) => {
+    if (visited.has(tableName)) return;
+    if (visiting.has(tableName)) {
+      throw new Error(`Dependensi tabel melingkar ditemukan saat drop di "${tableName}".`);
+    }
+    visiting.add(tableName);
+    for (const dependent of getDropDependents(schema, tableName)) {
+      if (tables.has(dependent)) visit(dependent);
+    }
+    visiting.delete(tableName);
+    visited.add(tableName);
+    order.push(tableName);
+  };
+
+  for (const tableName of tables) visit(tableName);
+  return order;
+}
+
+function removeDroppedTableFromSchema(schema, tableName) {
+  schema.tables.delete(tableName);
+  schema.pendingLinks = schema.pendingLinks.filter(
+    (pending) =>
+      pending.sourceTable !== tableName &&
+      pending.rel.targetTable !== tableName
+  );
+  for (const tableDef of schema.tables.values()) {
+    for (const [name, relation] of tableDef.relations) {
+      if (relation.targetTable === tableName || relation.junctionTable === tableName) {
+        tableDef.relations.delete(name);
+      }
+    }
+  }
+}
+
+function buildExplicitDropTableSql(dialect, tableName) {
+  return `DROP TABLE IF EXISTS ${dialect.quoteId(tableName)};`;
+}
+
 function buildDropTableSql(dialect, targetTable) {
   const q = dialect.quoteId;
   if (dialect.name === "postgres") {

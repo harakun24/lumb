@@ -119,6 +119,8 @@ Running `make:<table>` on an existing table compares columns and applies safe ch
 - Adds $fresh: true for always make a fresh table
 - Adds $ignore: true for ignoring the table definition when the table already exist
 
+Drop a table with `drop:<table>`. Lumb refuses when it knows the table has dependents; pass `$cascade: true` to drop the dependent tables too, including owned child tables and many-to-many junctions. `$dryRun: true` returns the ordered SQL plan without changing the database or schema registry. DDL cannot run inside `$tx`.
+
 ```javascript
 // Deferred link: produk references kategori before kategori is created
 await db("make:produk", {
@@ -183,7 +185,20 @@ await db(
   },
   { $ignore: true },
 );
+
+// Inspect dependent tables before dropping them
+const dropPlan = await db("drop:produk", {}, {
+  $cascade: true,
+  $dryRun: true,
+});
+
+// Execute the planned drop
+await db("drop:produk", {}, { $cascade: true });
 ```
+
+`$cascade` includes tables known to the current Lumb schema; database-level dependencies not registered in that schema are left to the DBMS to reject. Since DDL transactionality differs between DBMSs, a failed multi-table cascade may have already dropped some tables; the error reports which ones completed.
+
+Dropping a user table does not purge its retained Timeline or internal audit/idempotency data. Use `forget:` before dropping where applicable, and account for retained non-null fields and existing historical entries.
 
 ---
 
@@ -270,6 +285,8 @@ await db(
 - **Sorting & projection**: `$sort: "harga:desc,nama:asc"` and `$fields: ["kode", "nama", "harga"]`
 - **Page pagination**: `$page: 1, $limit: 20` returns `{ data, meta: { page, limit, total, totalPages } }`
 - **Cursor pagination**: `$cursor: 100, $limit: 20` fetches records with primary key greater than the cursor
+- **Streaming**: `$stream: true` or a batch size returns an async iterable paged by primary key; `$limit` caps the total rows
+- **Point-in-time reads**: `get:<table>/<pk>` with `$at: Date | timestamp string` reconstructs a single record from tracked Timeline changes
 - **Aggregations**: `$group`, `$count`, `$sum`, `$avg`, `$min`, `$max`
 - **Soft-delete visibility**: default excludes soft-deleted rows; `$trash: "include"` includes them; `$trash: "only"` returns only soft-deleted rows
 - **Diagnostics and export**: `explain:<table>` returns the compiled SQL, parameters, and query plan; `inspect:<table>` returns column metadata; `dump:<table>` returns all hydrated rows
@@ -285,6 +302,11 @@ const filtered = await db("get:produk", {
 const paged = await db("get:produk", { $page: 1, $limit: 10 });
 const cursorRows = await db("get:transaksi", { $cursor: 0, $limit: 20 });
 
+const stream = await db("get:transaksi", {}, { $stream: 200 });
+for await (const transaction of stream) {
+  await processTransaction(transaction);
+}
+
 const summary = await db("get:produk", {
   $group: "kategori",
   $count: "kode",
@@ -296,6 +318,36 @@ const plan = await db("explain:produk", { stok: { lte: 5 } });
 const info = await db("inspect:produk");
 const backup = await db("dump:kategori");
 ```
+
+#### Purpose-Aware Access and Data Forgetting
+
+Attach `$purpose` and `$actor.id` to a `get:` or `dump:` read to save an access receipt. Receipts contain the actor, purpose, table, requested fields/relations, filter field names, timestamp, and returned row count—not filter values or row data. Read them with `access:history`, optionally filtering by table, `$actor`, `$purpose`, `$since`, and `$limit`.
+
+```javascript
+const customer = await db("get:customers/42", {}, {
+  $purpose: "support ticket #184",
+  $actor: { id: "agent-7" },
+  $fields: ["name", "email"],
+});
+
+const recentReads = await db("access:history", {}, {
+  $actor: { id: "agent-7" },
+  $since: new Date(Date.now() - 24 * 60 * 60 * 1000),
+  $limit: 100,
+});
+```
+
+`$purpose` requires `$actor.id`; it does not support `$tx`, `$stream`, aggregation, or sub-resource reads, so each receipt describes a complete table read and can be committed independently. `access:history` exposes audit metadata; applications should apply their normal authorization checks before returning receipts.
+
+Use `forget:<table>/<pk>` with `$fields` to null selected nullable, non-primary-key columns. Lumb also scrubs matching tracked Timeline changes/snapshots, invalidates matching branches, replaces linked `$once` results with a tombstone, and marks linked undelivered outbox events as forgotten.
+
+```javascript
+await db("forget:customers/42", {}, {
+  $fields: ["email", "phone"],
+});
+```
+
+This keeps the record and its primary key. Outbox events already claimed by a worker or delivered to external systems cannot be reliably recalled. Historical `$once`/outbox entries created before forget-reference tracking, changes made outside tracked Lumb mutations, and copies in external systems cannot be discovered or erased automatically.
 
 ---
 
@@ -343,6 +395,45 @@ await db("delete:produk", ["PR0001"]);
 await db("delete:kategori/1", { $cascade: true });
 ```
 
+#### Operator-Safe Micro-Directives
+
+These directives add application-level safeguards around mutations and data delivery:
+
+- **`$expect`**: compare exact scalar column values inside the mutation transaction before `patch:` or `delete:`. A stale or missing row blocks the whole operation with `DataOperationBlockedError`.
+- **`$maxAffected`**: abort `patch:` or `delete:` if the selected rows exceed the limit. Deletes also count cascaded child records; many-to-many junction rows are not counted.
+- **`$once`**: attach a persistent idempotency key to `post:`, `patch:`, `delete:`, or `seed:`. Identical requests replay the original result (including `Date` values); reusing a key for a different request is blocked. Receipts remain in the database and do not expire automatically.
+- **`$outbox`**: append one or more `{ type, payload }` events in the same transaction as a mutation. Workers claim with `outbox:claim`, then acknowledge or reschedule with their claim token. Delivery is at-least-once; publish externally before acknowledging, and make consumers idempotent.
+- **`$redact`**: replace matching field names with `"[REDACTED]"` in returned values and emitted events. This is presentation filtering only; it does not erase stored rows or Timeline history.
+- **`$stream`**: return an async iterable without holding a transaction while the consumer processes it. Streams use ascending primary-key pagination; `true` uses batches of 100, or pass an integer from 1 to 1000. Offset, custom sorting, aggregation, explicit joins, and primary-key filters are not supported. A `$fields` projection must include the primary key.
+- **`$at`**: reconstruct one record at a `Date` or timestamp string using Timeline entries. It requires `get:<table>/<pk>` and does not support filters or `$with`; writes made outside lumb or through `raw:` are not represented.
+- **`$retry`**: retry a `batch:` on recognized transient database errors. A boolean `true` retries twice; an integer from 0 to 5 specifies additional retries. Events are emitted only after a successful commit. Retry is refused if the schema contains custom contract, getter, or soft-delete callbacks, which could have external side effects.
+
+```javascript
+await db(`patch:orders/${order.id}`, { status: "approved" }, {
+  $expect: { status: "pending" },
+  $maxAffected: 1,
+  $outbox: {
+    type: "order.approved",
+    payload: { orderId: order.id },
+  },
+});
+
+const events = await db("outbox:claim", {}, {
+  $worker: "mail-worker",
+  $limit: 20,
+  $ttl: 30000,
+});
+for (const event of events) {
+  await publish(event);
+  await db(`outbox:ack/${event.id}`, {}, { $claim: event.claimToken });
+}
+
+const safeOrder = await db(`get:orders/${order.id}`, {}, {
+  $at: new Date("2025-01-01T00:00:00Z"),
+  $redact: ["internalNote"],
+});
+```
+
 ---
 
 ### 8. Explicit Transactions, Savepoints, Cross-Table Batch, Scope, and Raw SQL
@@ -381,6 +472,7 @@ try {
 #### Atomic Cross-Table Batch (`batch:`)
 
 Executes a list of `[command, payload, options]` tuples inside a single transaction that commits on success or rolls back on failure.
+Pass `$retry: true` or an integer from 0 to 5 to retry the entire batch after recognized transient database errors.
 
 ```javascript
 await db("batch:", [

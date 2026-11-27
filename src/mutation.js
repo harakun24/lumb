@@ -8,6 +8,11 @@ import {
   validateContractChanges
 } from "./contracts.js";
 import { assertMutationLeaseAccess } from "./lease.js";
+import {
+  addAffectedRows,
+  assertExpectedState,
+  MAX_AFFECTED_STATE
+} from "./operation-guards.js";
 
 const DEFAULT_CHUNK_SIZE = 500;
 const NESTED_CONTRACT_VALIDATION = Symbol("lumb.contract.nested");
@@ -365,6 +370,20 @@ export async function executePatch(parsed, payload, directives, emitEvent) {
     throw new Error(`Perintah "patch:${tableDef.name}" tanpa ID di URL wajib menyertakan direktif "$where".`);
   }
 
+  if (directives.$expect !== undefined) {
+    const expectedWhere = buildWhereClause(targetFilters, schema, tableDef.name, dialect);
+    const expectedRows = await runner.all(
+      `SELECT * FROM ${q(tableDef.name)}${expectedWhere.sql ? ` WHERE ${expectedWhere.sql}` : ""}` +
+      `${dialect.forUpdateSql(true)};`,
+      expectedWhere.params
+    );
+    assertExpectedState(
+      tableDef,
+      expectedRows.map((row) => hydrateRow(tableDef, row)),
+      directives.$expect
+    );
+  }
+
   const { m2mValues } = extractNestedWriteData(tableDef, payload);
   const prepared = validateAndPrepareRow(tableDef, schema, payload, true);
   const setClauses = [];
@@ -472,6 +491,21 @@ export async function executeDelete(parsed, payload, directives, emitEvent) {
     return { deleted: 0 };
   }
   await assertMutationLeaseAccess(conn, runner, tableDef, targetRows, directives);
+  if (directives[NESTED_CONTRACT_VALIDATION]) {
+    addAffectedRows(
+      directives[MAX_AFFECTED_STATE],
+      targetRows.length,
+      tableDef,
+      targetRows
+    );
+  }
+  if (directives.$expect !== undefined) {
+    assertExpectedState(
+      tableDef,
+      targetRows.map((row) => hydrateRow(tableDef, row)),
+      directives.$expect
+    );
+  }
 
   const targetIds = targetRows.map((r) => r[tableDef.primaryKey]);
 
@@ -484,6 +518,7 @@ export async function executeDelete(parsed, payload, directives, emitEvent) {
           ...directives,
           $where: { [rel.foreignKey]: targetIds },
           $hard: true,
+          $expect: undefined,
           [NESTED_CONTRACT_VALIDATION]: true
         },
         emitEvent
@@ -514,6 +549,7 @@ export async function executeDelete(parsed, payload, directives, emitEvent) {
             {
               ...directives,
               $where: { [rel.foreignKey]: targetIds },
+              $expect: undefined,
               [NESTED_CONTRACT_VALIDATION]: true
             },
             emitEvent

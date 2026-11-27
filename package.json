@@ -1,7 +1,7 @@
 {
   "name": "@dim24/lumb",
-  "version": "0.0.1",
-  "description": "Manage relational databases using simple URL commands and JavaScript object",
+  "version": "1.0.1",
+  "description": "URL-driven database library for JavaScript that pairs plain-object simplicity with full control over schemas, relations, and transactions",
   "homepage": "https://github.com/harakun24/lumb#readme",
   "bugs": {
     "url": "https://github.com/harakun24/lumb/issues"
@@ -23,6 +23,12 @@
   "keywords": [
     "database",
     "orm alternative",
+    "ORM",
+    "relational database",
+    "database library",
+    "backend",
+    "database driver",
+    "database client",
     "sqlite",
     "postgres",
     "mysql",
@@ -30,7 +36,8 @@
     "schema",
     "javascript",
     "nodejs",
-    "query"
+    "query",
+    "SQL"
   ],
   "devDependencies": {
     "mysql2": "^3.24.6",
