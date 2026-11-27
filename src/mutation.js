@@ -2,8 +2,15 @@ import { buildWhereClause, splitDirectives } from "./parser.js";
 import { assertSchemaReady, hydrateRow, validateAndPrepareRow } from "./schema.js";
 import { beginTransaction, commitTransaction, resolveExecutionTarget, rollbackTransaction } from "./transaction.js";
 import { applySoftDeleteFilter } from "./query.js";
+import {
+  DataOperationBlockedError,
+  IMPACT_CAPTURE,
+  validateContractChanges
+} from "./contracts.js";
+import { assertMutationLeaseAccess } from "./lease.js";
 
 const DEFAULT_CHUNK_SIZE = 500;
+const NESTED_CONTRACT_VALIDATION = Symbol("lumb.contract.nested");
 
 export async function executePost(parsed, payload, directives, emitEvent) {
   const { conn, runner } = resolveExecutionTarget(directives);
@@ -12,7 +19,15 @@ export async function executePost(parsed, payload, directives, emitEvent) {
   const q = dialect.quoteId;
 
   if (Array.isArray(payload)) {
-    return executeBatchInsert(tableDef, payload, directives, conn, runner, emitEvent);
+    return executeBatchInsert(
+      tableDef,
+      payload,
+      directives,
+      conn,
+      runner,
+      emitEvent,
+      directives.$timelineCapture
+    );
   }
 
   const { ownedChildren, m2mValues } = extractNestedWriteData(tableDef, payload);
@@ -50,6 +65,19 @@ export async function executePost(parsed, payload, directives, emitEvent) {
         emitEvent
       );
       savedChildren.push(saved);
+      const childDef = assertSchemaReady(conn, rel.targetTable);
+      const after = persistedColumns(childDef, saved);
+      const nestedChange = {
+        table: childDef.name,
+        pk: after[childDef.primaryKey],
+        operation: "insert",
+        before: null,
+        after,
+        relationsBefore: {},
+        relationsAfter: await relationValues(conn, runner, childDef, saved)
+      };
+      recordNestedImpact(directives, nestedChange);
+      await validateContractChanges(conn, [nestedChange], "post");
     }
     hydrated[fieldName] = savedChildren;
   }
@@ -72,16 +100,31 @@ export async function executePost(parsed, payload, directives, emitEvent) {
   return hydrated;
 }
 
-async function executeBatchInsert(tableDef, rows, directives, conn, runner, emitEvent) {
+async function executeBatchInsert(tableDef, rows, directives, conn, runner, emitEvent, timelineCapture) {
   if (rows.length === 0) return { inserted: 0, total: 0 };
 
   const { dialect, schema } = conn;
   const q = dialect.quoteId;
+  if (timelineCapture) {
+    return executeTrackedBatchInsert(
+      tableDef,
+      rows,
+      directives,
+      conn,
+      runner,
+      emitEvent,
+      timelineCapture
+    );
+  }
   const chunkSize = Math.max(1, Number(directives.$chunk ?? DEFAULT_CHUNK_SIZE));
   const conflictMode = directives.$onConflict;
   const preparedRows = rows.map((r) => validateAndPrepareRow(tableDef, schema, r, false));
 
-  const cols = Object.keys(preparedRows[0]);
+  const cols = [...tableDef.columns.keys()].filter((col) =>
+    preparedRows.some((row) => Object.prototype.hasOwnProperty.call(row, col))
+  );
+  const hasAutoPk = tableDef.columns.get(tableDef.primaryKey)?.isAutoIncrement;
+  if (cols.length === 0 && hasAutoPk) cols.push(tableDef.primaryKey);
   const colListSql = cols.map(q).join(", ");
   const updateCols = cols.filter((c) => c !== tableDef.primaryKey);
 
@@ -94,6 +137,9 @@ async function executeBatchInsert(tableDef, rows, directives, conn, runner, emit
 
       const rowPlaceholders = chunk.map((row) => {
         const singleRow = cols.map((c) => {
+          if (row[c] === undefined && c === tableDef.primaryKey && hasAutoPk && dialect.name === "postgres") {
+            return "DEFAULT";
+          }
           paramIdx += 1;
           params.push(dialect.serialize(row[c]));
           return dialect.param(paramIdx);
@@ -128,6 +174,76 @@ async function executeBatchInsert(tableDef, rows, directives, conn, runner, emit
   }
 
   const summary = { inserted: totalInserted, total: rows.length };
+  emitEvent(`post:${tableDef.name}`, summary);
+  return summary;
+}
+
+async function executeTrackedBatchInsert(tableDef, rows, directives, conn, runner, emitEvent, timelineCapture) {
+  const { dialect, schema } = conn;
+  const q = dialect.quoteId;
+  let inserted = 0;
+
+  for (const input of rows) {
+    const row = validateAndPrepareRow(tableDef, schema, input, false);
+    const cols = Object.keys(row);
+    const hasAutoPk = tableDef.columns.get(tableDef.primaryKey)?.isAutoIncrement;
+    if (cols.length === 0 && hasAutoPk) cols.push(tableDef.primaryKey);
+    const values = [];
+    let parameterIndex = 0;
+    const placeholders = cols.map((column) => {
+      if (row[column] === undefined && column === tableDef.primaryKey && hasAutoPk && dialect.name === "postgres") {
+        return "DEFAULT";
+      }
+      parameterIndex += 1;
+      values.push(dialect.serialize(row[column]));
+      return dialect.param(parameterIndex);
+    }).join(", ");
+
+    const sql = directives.$onConflict
+      ? dialect.upsertSql(
+        q(tableDef.name),
+        cols.map(q).join(", "),
+        `(${placeholders})`,
+        q(tableDef.primaryKey),
+        cols.filter((column) => column !== tableDef.primaryKey),
+        directives.$onConflict
+      )
+      : dialect.insertSql(
+        q(tableDef.name),
+        cols.map(q).join(", "),
+        placeholders,
+        q(tableDef.primaryKey),
+        Boolean(hasAutoPk)
+      );
+
+    const result = await runner.run(sql, values);
+    inserted += result.changes;
+    if (result.changes === 0) continue;
+
+    let pkValue = row[tableDef.primaryKey] ?? result.lastInsertId;
+    if (pkValue === undefined || pkValue === null) {
+      const uniqueColumn = [...tableDef.columns.values()].find((column) =>
+        column.unique && Object.prototype.hasOwnProperty.call(row, column.name)
+      );
+      if (uniqueColumn) {
+        const found = await runner.get(
+          `SELECT ${q(tableDef.primaryKey)} FROM ${q(tableDef.name)} WHERE ${q(uniqueColumn.name)} = ${dialect.param(1)};`,
+          [dialect.serialize(row[uniqueColumn.name])]
+        );
+        pkValue = found?.[tableDef.primaryKey];
+      }
+    }
+
+    if (pkValue !== undefined && pkValue !== null) {
+      const saved = await runner.get(
+        `SELECT * FROM ${q(tableDef.name)} WHERE ${q(tableDef.primaryKey)} = ${dialect.param(1)};`,
+        [dialect.serialize(pkValue)]
+      );
+      if (saved) timelineCapture.rows.push(hydrateRow(tableDef, saved));
+    }
+  }
+
+  const summary = { inserted, total: rows.length };
   emitEvent(`post:${tableDef.name}`, summary);
   return summary;
 }
@@ -348,13 +464,14 @@ export async function executeDelete(parsed, payload, directives, emitEvent) {
   const whereSql = where.sql ? ` WHERE ${where.sql}` : "";
 
   const targetRows = await runner.all(
-    `SELECT * FROM ${q(tableDef.name)}${whereSql};`,
+    `SELECT * FROM ${q(tableDef.name)}${whereSql}${dialect.forUpdateSql(true)};`,
     where.params
   );
 
   if (targetRows.length === 0) {
     return { deleted: 0 };
   }
+  await assertMutationLeaseAccess(conn, runner, tableDef, targetRows, directives);
 
   const targetIds = targetRows.map((r) => r[tableDef.primaryKey]);
 
@@ -363,7 +480,12 @@ export async function executeDelete(parsed, payload, directives, emitEvent) {
       await executeDelete(
         { action: "delete", table: rel.targetTable, pk: null },
         {},
-        { ...directives, $where: { [rel.foreignKey]: targetIds }, $hard: true },
+        {
+          ...directives,
+          $where: { [rel.foreignKey]: targetIds },
+          $hard: true,
+          [NESTED_CONTRACT_VALIDATION]: true
+        },
         emitEvent
       );
       continue;
@@ -389,13 +511,22 @@ export async function executeDelete(parsed, payload, directives, emitEvent) {
           await executeDelete(
             { action: "delete", table: childDef.name, pk: null },
             {},
-            { ...directives, $where: { [rel.foreignKey]: targetIds } },
+            {
+              ...directives,
+              $where: { [rel.foreignKey]: targetIds },
+              [NESTED_CONTRACT_VALIDATION]: true
+            },
             emitEvent
           );
         } else {
-          throw new Error(
-            `Data pada "${tableDef.name}" tidak dapat dihapus karena masih digunakan oleh tabel "${childDef.name}". Gunakan { $cascade: true } untuk menghapus berantai.`
-          );
+          const message =
+            `Data pada "${tableDef.name}" tidak dapat dihapus karena masih digunakan oleh tabel "${childDef.name}". Gunakan { $cascade: true } untuk menghapus berantai.`;
+          throw new DataOperationBlockedError([{
+            type: "relation",
+            table: tableDef.name,
+            relatedTable: childDef.name,
+            message
+          }]);
         }
       }
     }
@@ -413,6 +544,28 @@ export async function executeDelete(parsed, payload, directives, emitEvent) {
       }
     );
     tableDef.removeFn.call(proxy);
+    if (directives[NESTED_CONTRACT_VALIDATION]) {
+      const relationStates = await Promise.all(targetRows.map(async (raw) => {
+        const row = hydrateRow(tableDef, raw);
+        return relationValues(conn, runner, tableDef, row);
+      }));
+      const contractChanges = targetRows.map((raw, index) => {
+        const before = hydrateRow(tableDef, raw);
+        const after = { ...before, ...liveChanges };
+        const relationState = relationStates[index];
+        return {
+          table: tableDef.name,
+          pk: before[tableDef.primaryKey],
+          operation: "delete",
+          before: persistedColumns(tableDef, before),
+          after: persistedColumns(tableDef, after),
+          relationsBefore: relationState,
+          relationsAfter: relationState
+        };
+      });
+      recordNestedImpact(directives, contractChanges);
+      await validateContractChanges(conn, contractChanges, "delete");
+    }
 
     const setParts = [];
     const setParams = [];
@@ -429,6 +582,28 @@ export async function executeDelete(parsed, payload, directives, emitEvent) {
     const summary = { deleted: res.changes, softDeleted: true };
     emitEvent(`delete:${tableDef.name}`, summary);
     return summary;
+  }
+
+  let nestedRelationValues = [];
+  if (directives[NESTED_CONTRACT_VALIDATION]) {
+    nestedRelationValues = await Promise.all(targetRows.map(async (raw) => {
+      const row = hydrateRow(tableDef, raw);
+      return relationValues(conn, runner, tableDef, row);
+    }));
+    const contractChanges = targetRows.map((raw) => {
+      const before = hydrateRow(tableDef, raw);
+      return {
+        table: tableDef.name,
+        pk: before[tableDef.primaryKey],
+        operation: "delete",
+        before: persistedColumns(tableDef, before),
+        after: null,
+        relationsBefore: {},
+        relationsAfter: {}
+      };
+    });
+    recordNestedImpact(directives, contractChanges, nestedRelationValues);
+    await validateContractChanges(conn, contractChanges, "delete");
   }
 
   for (const rel of tableDef.relations.values()) {
@@ -463,4 +638,40 @@ function extractNestedWriteData(tableDef, payload) {
   }
 
   return { ownedChildren, m2mValues };
+}
+
+function persistedColumns(tableDef, row) {
+  const result = {};
+  for (const column of tableDef.columns.keys()) {
+    if (Object.prototype.hasOwnProperty.call(row ?? {}, column)) result[column] = row[column];
+  }
+  return result;
+}
+
+async function relationValues(conn, runner, tableDef, row) {
+  const values = {};
+  const q = conn.dialect.quoteId;
+  for (const [name, relation] of tableDef.relations) {
+    if (relation.kind !== "many-to-many") continue;
+    const links = await runner.all(
+      `SELECT ${q(relation.junctionTargetKey)} AS target_id FROM ${q(relation.junctionTable)} WHERE ${q(relation.junctionLocalKey)} = ${conn.dialect.param(1)};`,
+      [conn.dialect.serialize(row[relation.localKey])]
+    );
+    values[name] = links.map((item) => item.target_id);
+  }
+  return values;
+}
+
+function recordNestedImpact(directives, changes, relationsBefore = []) {
+  const capture = directives[IMPACT_CAPTURE];
+  if (!capture) return;
+  if (!Array.isArray(capture.nestedChanges)) capture.nestedChanges = [];
+  const items = Array.isArray(changes) ? changes : [changes];
+  items.forEach((change, index) => {
+    capture.nestedChanges.push({
+      ...change,
+      relationsBefore: relationsBefore[index] ?? change.relationsBefore ?? {},
+      relationsAfter: change.relationsAfter ?? {}
+    });
+  });
 }

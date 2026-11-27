@@ -1,5 +1,6 @@
 import { getConnection } from "./connection.js";
 import { generateTypeDefinitions } from "./typegen.js";
+import { normalizeContracts } from "./contracts.js";
 
 /**
  * Menerjemahkan objek Blueprint-by-Example menjadi struktur tabel & relasi database
@@ -10,7 +11,7 @@ export async function defineTable(tableName, blueprint, directives = {}) {
   }
 
   for (const key of Object.keys(blueprint)) {
-    if (key.startsWith("$")) {
+    if (key.startsWith("$") && key !== "$contracts") {
       throw new Error(`Nama kolom tidak boleh diawali karakter "$": "${key}".`);
     }
   }
@@ -59,6 +60,7 @@ export async function defineTable(tableName, blueprint, directives = {}) {
 
   // 2. Urai setiap properti pada objek contoh JS
   for (const key of Object.keys(blueprint)) {
+    if (key === "$contracts") continue;
     const desc = Object.getOwnPropertyDescriptor(blueprint, key);
 
     if (key === "remove" && typeof desc.value === "function") {
@@ -142,6 +144,9 @@ export async function defineTable(tableName, blueprint, directives = {}) {
     columns,
     relations,
     getters,
+    contracts: directives.$contracts !== undefined || blueprint.$contracts !== undefined
+      ? normalizeContracts(tableName, directives.$contracts ?? blueprint.$contracts)
+      : schema.tables.get(tableName)?.contracts ?? [],
     softDeletePatch,
     removeFn: typeof blueprint.remove === "function" ? blueprint.remove : null,
     indexes: $index,
@@ -155,7 +160,7 @@ export async function defineTable(tableName, blueprint, directives = {}) {
     const targetDef = rel.targetTable === tableName ? tableDef : schema.tables.get(rel.targetTable);
     if (targetDef) {
       applyForeignKeyMetadata(tableDef, colName, rel, targetDef, true);
-    } else {
+    } else if (!$dryRun) {
       schema.pendingLinks.push({
         sourceTable: tableName,
         colName,
@@ -170,8 +175,10 @@ export async function defineTable(tableName, blueprint, directives = {}) {
     if (pending.rel.targetTable === tableName) {
       const srcDef = schema.tables.get(pending.sourceTable);
       if (srcDef) {
-        applyForeignKeyMetadata(srcDef, pending.colName, pending.rel, tableDef, true);
-        registerReverseRelation(tableDef, srcDef, pending.colName);
+        if (!$dryRun) {
+          applyForeignKeyMetadata(srcDef, pending.colName, pending.rel, tableDef, true);
+          registerReverseRelation(tableDef, srcDef, pending.colName);
+        }
         if (!dialect.supportsDeferredFkInCreate) {
           const fkName = `fk_${srcDef.name}_${pending.colName}`;
           const fkCheck = dialect.hasForeignKeyQuery(srcDef.name, fkName);
@@ -190,11 +197,13 @@ export async function defineTable(tableName, blueprint, directives = {}) {
       remainingPending.push(pending);
     }
   }
-  schema.pendingLinks = remainingPending;
+  if (!$dryRun) {
+    schema.pendingLinks = remainingPending;
+  }
 
   for (const [colName, rel] of relations.entries()) {
     const targetDef = schema.tables.get(rel.targetTable);
-    if (targetDef && targetDef.name !== tableDef.name) {
+    if (!$dryRun && targetDef && targetDef.name !== tableDef.name) {
       registerReverseRelation(targetDef, tableDef, colName);
     }
   }
@@ -288,15 +297,17 @@ export async function defineTable(tableName, blueprint, directives = {}) {
       junctionSqlList.push(createJunctionSql);
     }
 
-    schema.tables.set(junctionName, {
-      name: junctionName,
-      primaryKey: localFk,
-      columns: new Map(),
-      relations: new Map(),
-      getters: new Map(),
-      softDeletePatch: null,
-      isJunction: true
-    });
+    if (!$dryRun) {
+      schema.tables.set(junctionName, {
+        name: junctionName,
+        primaryKey: localFk,
+        columns: new Map(),
+        relations: new Map(),
+        getters: new Map(),
+        softDeletePatch: null,
+        isJunction: true
+      });
+    }
 
     relations.set(m2m.fieldName, {
       kind: "many-to-many",
@@ -309,7 +320,9 @@ export async function defineTable(tableName, blueprint, directives = {}) {
     });
   }
 
-  schema.tables.set(tableName, tableDef);
+  if (!$dryRun) {
+    schema.tables.set(tableName, tableDef);
+  }
 
   if ($dryRun) {
     return { dryRun: true, table: tableName, dialect: dialect.name, sql: plannedSql };

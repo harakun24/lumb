@@ -27,7 +27,21 @@ export async function executeGet(parsed, filters, directives, emitEvent) {
     return executeAggregationGet(tableDef, effectiveFilters, directives, conn, runner, emitEvent);
   }
 
-  const { sql, params, countSql, countParams } = compileSelectSql(tableDef, effectiveFilters, directives, conn);
+  const requestedFields = normalizeRequestedFields(directives.$fields);
+  const selectedFields = relationSelectFields(
+    tableDef,
+    requestedFields,
+    directives.$with
+  );
+  const selectDirectives = selectedFields
+    ? { ...directives, $fields: selectedFields }
+    : directives;
+  const { sql, params, countSql, countParams } = compileSelectSql(
+    tableDef,
+    effectiveFilters,
+    selectDirectives,
+    conn
+  );
   const start = performance.now();
   const rawRows = await runner.all(sql, params);
   emitEvent("query", { action: `get:${parsed.table}`, sql, params, durationMs: performance.now() - start });
@@ -36,6 +50,12 @@ export async function executeGet(parsed, filters, directives, emitEvent) {
 
   if (directives.$with && rows.length > 0) {
     rows = await attachNestedRelations(tableDef, rows, directives.$with, directives, conn, runner, emitEvent);
+  }
+
+  if (requestedFields) {
+    rows = rows.map((row) =>
+      removeUnrequestedFields(row, requestedFields, selectedFields, directives.$with)
+    );
   }
 
   if (parsed.pk !== null) {
@@ -173,6 +193,8 @@ async function executeSqlJoinedGet(tableDef, pk, filters, directives, conn, runn
 
   const joinClauses = [];
   const joinPlans = [];
+  const joinParams = [];
+  const paramCounter = { count: 0 };
 
   for (const [relName, rawCfg] of Object.entries(directives.$with)) {
     const cfg = rawCfg === true ? {} : rawCfg;
@@ -180,6 +202,23 @@ async function executeSqlJoinedGet(tableDef, pk, filters, directives, conn, runn
     const targetTable = rel ? rel.targetTable : relName;
     const targetDef = assertSchemaReady(conn, targetTable);
     const relAlias = `_rel_${relName}`;
+    const targetFilters = applySoftDeleteFilter(
+      targetDef,
+      {},
+      directives.$trash
+    );
+    const targetWhere = buildWhereClause(
+      targetFilters,
+      schema,
+      targetTable,
+      dialect,
+      null,
+      paramCounter
+    );
+    const targetSource = targetWhere.sql
+      ? `(SELECT * FROM ${q(targetTable)} WHERE ${targetWhere.sql}) ${q(relAlias)}`
+      : `${q(targetTable)} ${q(relAlias)}`;
+    joinParams.push(...targetWhere.params);
 
     const joinKeyword = mapJoinType(cfg.$join ?? "left");
     let onClause = "";
@@ -196,7 +235,7 @@ async function executeSqlJoinedGet(tableDef, pk, filters, directives, conn, runn
       }
     }
 
-    joinClauses.push(`${joinKeyword} ${q(targetTable)} ${q(relAlias)}${onClause}`);
+    joinClauses.push(`${joinKeyword} ${targetSource}${onClause}`);
 
     const targetFields = Array.isArray(cfg.$fields) ? cfg.$fields : [...targetDef.columns.keys()];
     for (const col of targetFields) {
@@ -206,13 +245,21 @@ async function executeSqlJoinedGet(tableDef, pk, filters, directives, conn, runn
     joinPlans.push({ relName, targetDef, targetFields, flat: Boolean(cfg.$flat) });
   }
 
-  const where = buildWhereClause(effectiveFilters, schema, tableDef.name, dialect, baseAlias);
+  const where = buildWhereClause(
+    effectiveFilters,
+    schema,
+    tableDef.name,
+    dialect,
+    baseAlias,
+    paramCounter
+  );
   const whereSql = where.sql ? ` WHERE ${where.sql}` : "";
   const sql = `SELECT ${selectCols.join(", ")} FROM ${q(tableDef.name)} ${q(baseAlias)} ${joinClauses.join(" ")}${whereSql};`;
+  const params = [...joinParams, ...where.params];
 
   const start = performance.now();
-  const rawRows = await runner.all(sql, where.params);
-  emitEvent("query", { action: `get:${tableDef.name}:join`, sql, params: where.params, durationMs: performance.now() - start });
+  const rawRows = await runner.all(sql, params);
+  emitEvent("query", { action: `get:${tableDef.name}:join`, sql, params, durationMs: performance.now() - start });
 
   const results = rawRows.map((row) => {
     const rawBase = {};
@@ -264,6 +311,37 @@ function mapJoinType(type) {
   }
 }
 
+function normalizeRequestedFields(fields) {
+  return Array.isArray(fields) && fields.length > 0
+    ? [...new Set(fields)]
+    : null;
+}
+
+function relationSelectFields(tableDef, requestedFields, withObj, requiredFields = []) {
+  if (!requestedFields) return undefined;
+
+  const fields = new Set(requestedFields);
+  for (const field of requiredFields) {
+    fields.add(field);
+  }
+  for (const relName of Object.keys(withObj ?? {})) {
+    const rel = tableDef.relations.get(relName);
+    if (rel) fields.add(rel.localKey);
+  }
+  return [...fields];
+}
+
+function removeUnrequestedFields(row, requestedFields, selectedFields, withObj) {
+  const requested = new Set([
+    ...requestedFields,
+    ...Object.keys(withObj ?? {})
+  ]);
+  for (const field of selectedFields ?? []) {
+    if (!requested.has(field)) delete row[field];
+  }
+  return row;
+}
+
 async function attachNestedRelations(tableDef, parentRows, withObj, directives, conn, runner, emitEvent) {
   const { dialect, schema } = conn;
   const q = dialect.quoteId;
@@ -304,8 +382,19 @@ async function attachNestedRelations(tableDef, parentRows, withObj, directives, 
       const queryFilters = applySoftDeleteFilter(targetDef, {
         ...childFilters,
         [rel.targetKey]: fkValues
-      });
-      const { sql, params } = compileSelectSql(targetDef, queryFilters, { $fields }, conn);
+      }, directives.$trash);
+      const selectedFields = relationSelectFields(
+        targetDef,
+        normalizeRequestedFields($fields),
+        nestedWith,
+        [rel.targetKey]
+      );
+      const { sql, params } = compileSelectSql(
+        targetDef,
+        queryFilters,
+        { $fields: selectedFields },
+        conn
+      );
       let relatedRows = (await runner.all(sql, params)).map((r) => hydrateRow(targetDef, r));
 
       if (Object.keys(nestedWith).length > 0 && relatedRows.length > 0) {
@@ -313,6 +402,11 @@ async function attachNestedRelations(tableDef, parentRows, withObj, directives, 
       }
 
       const byKey = new Map(relatedRows.map((r) => [r[rel.targetKey], r]));
+      if (normalizeRequestedFields($fields)) {
+        relatedRows = relatedRows.map((row) =>
+          removeUnrequestedFields(row, $fields, selectedFields, nestedWith)
+        );
+      }
       currentRows = currentRows.filter((row) => {
         const match = byKey.get(row[rel.localKey]) ?? null;
         row[relName] = match;
@@ -325,9 +419,19 @@ async function attachNestedRelations(tableDef, parentRows, withObj, directives, 
       const queryFilters = applySoftDeleteFilter(targetDef, {
         ...childFilters,
         [rel.foreignKey]: pkValues
-      });
-      const fieldsWithFk = Array.isArray($fields) ? [...new Set([...$fields, rel.foreignKey])] : undefined;
-      const { sql, params } = compileSelectSql(targetDef, queryFilters, { $fields: fieldsWithFk }, conn);
+      }, directives.$trash);
+      const selectedFields = relationSelectFields(
+        targetDef,
+        normalizeRequestedFields($fields),
+        nestedWith,
+        [rel.foreignKey]
+      );
+      const { sql, params } = compileSelectSql(
+        targetDef,
+        queryFilters,
+        { $fields: selectedFields },
+        conn
+      );
       let childRows = (await runner.all(sql, params)).map((r) => hydrateRow(targetDef, r));
 
       if (Object.keys(nestedWith).length > 0 && childRows.length > 0) {
@@ -338,8 +442,8 @@ async function attachNestedRelations(tableDef, parentRows, withObj, directives, 
       for (const child of childRows) {
         const key = child[rel.foreignKey];
         if (!grouped.has(key)) grouped.set(key, []);
-        if (Array.isArray($fields) && !$fields.includes(rel.foreignKey)) {
-          delete child[rel.foreignKey];
+        if (normalizeRequestedFields($fields)) {
+          removeUnrequestedFields(child, $fields, selectedFields, nestedWith);
         }
         grouped.get(key).push(child);
       }
@@ -369,8 +473,19 @@ async function attachNestedRelations(tableDef, parentRows, withObj, directives, 
       const queryFilters = applySoftDeleteFilter(targetDef, {
         ...childFilters,
         [rel.targetKey]: targetIds
-      });
-      const { sql, params } = compileSelectSql(targetDef, queryFilters, { $fields }, conn);
+      }, directives.$trash);
+      const selectedFields = relationSelectFields(
+        targetDef,
+        normalizeRequestedFields($fields),
+        nestedWith,
+        [rel.targetKey]
+      );
+      const { sql, params } = compileSelectSql(
+        targetDef,
+        queryFilters,
+        { $fields: selectedFields },
+        conn
+      );
       let targetRows = (await runner.all(sql, params)).map((r) => hydrateRow(targetDef, r));
 
       if (Object.keys(nestedWith).length > 0 && targetRows.length > 0) {
@@ -378,6 +493,11 @@ async function attachNestedRelations(tableDef, parentRows, withObj, directives, 
       }
 
       const targetById = new Map(targetRows.map((t) => [t[rel.targetKey], t]));
+      if (normalizeRequestedFields($fields)) {
+        targetRows = targetRows.map((row) =>
+          removeUnrequestedFields(row, $fields, selectedFields, nestedWith)
+        );
+      }
       const byParent = new Map();
       for (const j of junctionRows) {
         const item = targetById.get(j._target_id);

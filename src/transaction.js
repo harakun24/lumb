@@ -3,6 +3,15 @@ import { getConnection } from "./connection.js";
 
 const activeTransactions = new Map();
 
+function closeDescendantSavepoints(parentTxId, status) {
+  for (const session of [...activeTransactions.values()]) {
+    if (session.parentTxId !== parentTxId) continue;
+    closeDescendantSavepoints(session.id, status);
+    session.status = status;
+    activeTransactions.delete(session.id);
+  }
+}
+
 export async function beginTransaction(parentTxId, directives = {}) {
   if (parentTxId) {
     const parent = activeTransactions.get(parentTxId);
@@ -80,6 +89,7 @@ export async function commitTransaction(txId) {
 
   if (session.isSavepoint) {
     await session.client.exec(`RELEASE SAVEPOINT ${q(txId)};`);
+    closeDescendantSavepoints(txId, "committed");
     session.status = "committed";
     activeTransactions.delete(txId);
     return { committed: true, id: txId, savepoint: true };
@@ -90,6 +100,7 @@ export async function commitTransaction(txId) {
     await session.client.exec("COMMIT;");
     session.status = "committed";
   } finally {
+    closeDescendantSavepoints(txId, session.status ?? "closed");
     activeTransactions.delete(txId);
     await session.client.release().catch(() => { });
     session.releaseLock();
@@ -109,6 +120,7 @@ export async function rollbackTransaction(txId) {
   if (session.isSavepoint) {
     await session.client.exec(`ROLLBACK TO SAVEPOINT ${q(txId)};`);
     await session.client.exec(`RELEASE SAVEPOINT ${q(txId)};`);
+    closeDescendantSavepoints(txId, "rolled_back");
     session.status = "rolled_back";
     activeTransactions.delete(txId);
     return { rolledBack: true, id: txId, savepoint: true };
@@ -119,6 +131,7 @@ export async function rollbackTransaction(txId) {
     await session.client.exec("ROLLBACK;");
     session.status = "rolled_back";
   } finally {
+    closeDescendantSavepoints(txId, session.status ?? "closed");
     activeTransactions.delete(txId);
     await session.client.release().catch(() => { });
     session.releaseLock();
@@ -152,7 +165,7 @@ export async function executeCrossBatch(commands, dbExecutor, directives = {}) {
       if (Array.isArray(payload)) {
         results.push(await dbExecutor(cmd, payload, { ...opts, $tx: txId }));
       } else {
-        results.push(await dbExecutor(cmd, { ...payload, $tx: txId }, opts));
+        results.push(await dbExecutor(cmd, payload, { ...opts, $tx: txId }));
       }
     }
     await commitTransaction(txId);

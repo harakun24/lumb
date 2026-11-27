@@ -81,6 +81,15 @@ export function createDialect(name = "sqlite") {
   }
 
   function insertSql(tableQuoted, colsQuoted, placeholders, pkQuoted, hasAutoPk) {
+    if (!colsQuoted) {
+      if (normalized === "mysql") {
+        return `INSERT INTO ${tableQuoted} () VALUES ();`;
+      }
+      if (normalized === "postgres" && hasAutoPk) {
+        return `INSERT INTO ${tableQuoted} DEFAULT VALUES RETURNING ${pkQuoted};`;
+      }
+      return `INSERT INTO ${tableQuoted} DEFAULT VALUES;`;
+    }
     if (normalized === "postgres" && hasAutoPk) {
       return `INSERT INTO ${tableQuoted} (${colsQuoted}) VALUES (${placeholders}) RETURNING ${pkQuoted};`;
     }

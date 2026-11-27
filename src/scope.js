@@ -16,19 +16,44 @@ export function createScopedDb(targetTable, scopeContext, dbExecutor) {
           return [
             cmd,
             Array.isArray(subPayload)
-              ? subPayload.map((item) => ({ ...scopeContext, ...item }))
-              : { ...scopeContext, ...subPayload },
+              ? subPayload.map((item) => ({ ...item, ...scopeContext }))
+              : { ...subPayload, ...scopeContext },
             subOpts
           ];
         }
         if (subParsed.action === "patch" || subParsed.action === "delete") {
+          const scopedWhere = {
+            ...(subPayload?.$where ?? {}),
+            ...(subOpts.$where ?? {}),
+            ...scopeContext
+          };
+          const subOptions = {
+            ...subOpts,
+            $where: scopedWhere
+          };
+          const scopedPayload = subParsed.action === "patch" && Array.isArray(subPayload)
+            ? subPayload.map((item) => ({
+              ...item,
+              $where: { ...(item.$where ?? {}), ...scopedWhere }
+            }))
+            : subPayload;
           return [
             cmd,
-            { ...subPayload, $where: { ...scopeContext, ...(subPayload.$where ?? {}) } },
-            subOpts
+            scopedPayload,
+            subOptions
           ];
         }
-        return [cmd, { ...scopeContext, ...subPayload }, subOpts];
+        if (["claim", "lease", "release", "renew"].includes(subParsed.action)) {
+          return [
+            cmd,
+            subPayload,
+            {
+              ...subOpts,
+              $where: { ...(subOpts.$where ?? {}), ...scopeContext }
+            }
+          ];
+        }
+        return [cmd, { ...subPayload, ...scopeContext }, subOpts];
       });
       return dbExecutor(command, scopedCommands, options);
     }
@@ -37,30 +62,71 @@ export function createScopedDb(targetTable, scopeContext, dbExecutor) {
       return dbExecutor(command, payload, options);
     }
 
+    if (["claim", "lease", "release", "renew"].includes(parsed.action)) {
+      if (parsed.pk === null) {
+        return dbExecutor(command, payload, options);
+      }
+      return (async () => {
+        const scopedOptions = {
+          ...options,
+          $where: { ...(options.$where ?? {}), ...scopeContext }
+        };
+        const { primaryKey } = await dbExecutor(
+          `inspect:${targetTable}`,
+          {},
+          scopedOptions
+        );
+        const scopedRows = await dbExecutor(
+          `get:${targetTable}`,
+          { ...scopeContext, [primaryKey]: parsed.pk },
+          scopedOptions
+        );
+        if (scopedRows.length === 0) {
+          throw new Error(`Record "${targetTable}/${parsed.pk}" tidak ditemukan dalam scope ini.`);
+        }
+        return dbExecutor(command, payload, scopedOptions);
+      })();
+    }
+
     if (parsed.action === "get" || parsed.action === "explain") {
-      return dbExecutor(command, { ...scopeContext, ...payload }, options);
+      return dbExecutor(command, { ...payload, ...scopeContext }, options);
     }
 
     if (parsed.action === "post" || parsed.action === "seed") {
       if (Array.isArray(payload)) {
-        const scopedArray = payload.map((item) => ({ ...scopeContext, ...item }));
+        const scopedArray = payload.map((item) => ({ ...item, ...scopeContext }));
         return dbExecutor(command, scopedArray, options);
       }
-      return dbExecutor(command, { ...scopeContext, ...payload }, options);
+      return dbExecutor(command, { ...payload, ...scopeContext }, options);
     }
 
     if (parsed.action === "patch" || parsed.action === "delete") {
       if (Array.isArray(payload)) {
-        return dbExecutor(command, payload, options);
+        const scopedWhere = { ...(options.$where ?? {}), ...scopeContext };
+        const scopedPayload = parsed.action === "patch"
+          ? payload.map((item) => ({
+            ...item,
+            $where: { ...(item.$where ?? {}), ...scopedWhere }
+          }))
+          : payload;
+        return dbExecutor(command, scopedPayload, {
+          ...options,
+          $where: scopedWhere
+        });
       }
       const existingWhere = payload.$where ?? {};
+      const scopedWhere = {
+        ...existingWhere,
+        ...(options.$where ?? {}),
+        ...scopeContext
+      };
       return dbExecutor(
         command,
         {
           ...payload,
-          $where: { ...scopeContext, ...existingWhere }
+          $where: scopedWhere
         },
-        options
+        { ...options, $where: scopedWhere }
       );
     }
 

@@ -426,3 +426,133 @@ db.on("query", ({ action, durationMs }) => {
 unsubscribe();
 // Or: db.off("patch:produk", handler);
 ```
+
+---
+
+### 10. Data Timeline (`history:`, `why:`, `undo:`, `snapshot:`, `diff:`, `restore:`, `branch:`, `merge:`, `discard:`)
+
+Mutations performed through `post:`, `patch:`, `delete:`, and `seed:` are recorded automatically in the internal `_lumb_timeline` table. Each change is stored with before/after row values and optional audit metadata:
+
+```javascript
+await db("patch:produk/KP0001", { stok: 8 }, {
+  $actor: { id: "worker-1" },
+  $reason: "stock correction",
+  $source: "inventory-import",
+});
+
+const changes = await db("history:produk/KP0001");
+const stockOrigins = await db("why:produk/KP0001/stok");
+await db(`undo:${changes[0].id}`);
+```
+
+`history:<table>/<pk>` lists changes newest first. `why:<table>/<pk>/<field>` lists the recorded origins of a field. `undo:<changeId>` applies the inverse as a new tracked change; if the current row or tracked relation state no longer matches the recorded state, it fails with a conflict instead of overwriting newer data. Use `$dryRun: true` with `undo:` to inspect conflicts without applying the inverse.
+
+Snapshots save the selected rows and can be compared or restored later:
+
+```javascript
+const snapshot = await db("snapshot:produk", {
+  $where: { cabang: "CBG-01" },
+  $with: { tags: true },
+  $label: "before-import",
+});
+
+const changes = await db("diff:produk", { $from: snapshot.id });
+const restorePlan = await db("restore:produk", {
+  $from: snapshot.id,
+  $dryRun: true,
+});
+await db("restore:produk", { $from: snapshot.id });
+```
+
+Restore defaults to merging snapshot contents into current rows and leaves rows absent from the snapshot untouched. Pass `$mode: "replace"` to also delete rows that were not present in the snapshot. Conflicts are detected atomically before changes are committed. Many-to-many links included through `$with` are restored; snapshots do not currently restore owned child-table graphs. Likewise, undo does not reconstruct child-table rows removed by a cascading delete.
+
+Branches stage draft operations without changing live rows:
+
+```javascript
+const branch = await db("branch:produk/KP0001", { $label: "revised-stock" });
+await db(`patch:produk/KP0001`, { stok: 12 }, { $branch: branch.id });
+const draft = await db(`get:produk/KP0001`, {}, { $branch: branch.id });
+
+await db(`merge:${branch.id}`, { $dryRun: true });
+await db(`merge:${branch.id}`);
+// Or abandon an open branch:
+await db(`discard:${branch.id}`);
+```
+
+Branch writes are limited to the branch's table; `patch:` and `delete:` may target only its base record. Merge replays the staged operations in one transaction and rejects a stale base record. Timeline tracking covers mutations made through lumb; SQL issued through `raw:` and writes made outside lumb are not journaled.
+
+---
+
+### 11. Data Contracts and Impact Preview (`$contracts`, `impact:`)
+
+Attach business rules to a table with `$contracts`. Each `check` receives `{ table, pk, operation, action, before, after }` and must return a boolean (or a promise resolving to one). A failed rule rejects the mutation and rolls back that operation, including inside an explicit transaction or batch.
+
+```javascript
+await db(
+  "make:inventory",
+  { name: String, stock: 0 },
+  {
+    $contracts: [{
+      id: "stock-not-negative",
+      check: ({ after }) => after === null || after.stock >= 0,
+      message: "Stock cannot be negative.",
+    }],
+  },
+);
+```
+
+Contracts also work on owned child-table blueprints by putting `$contracts` inside the child object. Contract functions should be deterministic and free of external side effects. They currently validate changed rows; cross-row or aggregate contracts are not supported. They run for direct mutations, nested child writes/deletes, and timeline undo/restore operations performed through lumb.
+
+Use `impact:` to simulate a supported mutation in a rollback transaction and inspect its row changes and blockers:
+
+```javascript
+const plan = await db("impact:", {
+  command: "delete:orders/42",
+  payload: {},
+  options: { $cascade: true },
+});
+
+if (plan.canApply && plan.complete) {
+  console.log(plan.changes);
+}
+```
+
+Impact preview supports `post:`, `patch:`, `delete:`, and `seed:`. It reports Data Contract, database-constraint, and relation-integrity blockers; it does not persist rows or emit normal lumb mutation events, and it returns warnings for incomplete plans or hooks with possible external side effects. Batch `post:` with nested child rows is not yet fully planned. PostgreSQL and MySQL may advance auto-ID counters even though the preview transaction is rolled back. As with timeline tracking, writes through `raw:` or outside lumb do not receive contract enforcement.
+
+---
+
+### 12. Data Leases (`claim:`, `lease:`, `renew:`, `release:`)
+
+Data Leases let an operator hold a record while reviewing it, without keeping a database transaction open. Claims require `$actor.id`; `$ttl` is in milliseconds, defaults to 10 minutes, and must be between 1 second and 24 hours.
+
+```javascript
+const actor = { id: "operator-17", name: "Rina" };
+
+const claim = await db("claim:orders/42", {}, {
+  $actor: actor,
+  $ttl: 10 * 60 * 1000,
+});
+
+if (!claim.claimed) {
+  console.log("Sedang ditinjau oleh:", claim.lease.owner);
+} else {
+  const order = await db("get:orders/42");
+
+  await db("patch:orders/42", { reviewStatus: "approved" }, {
+    $actor: actor,
+    $lease: claim.token,
+    $reason: "Review selesai",
+  });
+
+  await db("release:orders/42", {}, {
+    $actor: actor,
+    $lease: claim.token,
+  });
+}
+```
+
+`lease:<table>/<pk>` inspects the active holder without returning its token. `renew:<table>/<pk>` extends an active lease and requires the same `$actor.id` and `$lease` token. `release:<table>/<pk>` also requires both; a stale release returns `{ released: false }` and cannot release a newer claim. Reclaiming an expired or released record increments its generation.
+
+Tracked `patch:`, `delete:`, `seed:` synchronization, conflicting `post:` operations, and nested cascade deletes are blocked when they touch an actively leased record unless the matching `$lease` token and owner are provided. Bulk writes are rejected atomically if any selected row is held. Mutations with a stale supplied token are rejected; tokenless mutations may proceed after expiration. Lease commands cannot run inside `$tx` because a human review must not depend on an open database transaction. Writes through `raw:` or outside lumb bypass lease enforcement.
+
+`$actor` must be derived by the application from its authenticated user; do not trust an operator ID supplied directly by a client. Lease rows remain in the internal `_lumb_leases` table after release or expiration so the generation stays monotonic; the table retains one small row per resource ever claimed.
